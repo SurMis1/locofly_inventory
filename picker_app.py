@@ -8,14 +8,11 @@ from pyzbar.pyzbar import decode as decode_barcode
 # ---------------------------------------
 # 🔗 PostgreSQL Connection (same as app.py)
 # ---------------------------------------
-DB_USER = "suraj"
-DB_PASSWORD = "yourpassword"
-DB_HOST = "localhost"
-DB_NAME = "inventory_db"
+import os
+from sqlalchemy import create_engine, text
 
-engine = create_engine(
-    f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
+engine = create_engine(DATABASE_URL)
 
 # ---------------------------------------
 # 🎨 Page Layout

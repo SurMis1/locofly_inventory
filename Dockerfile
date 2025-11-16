@@ -9,23 +9,24 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency file
-COPY requirements.txt .
+# copy dependencies
+COPY requirements.txt requirements.txt
 
-# Install Python dependencies
+# install python deps
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy everything
+# copy everything else
 COPY . .
 
-# Streamlit requires special flags for Cloud Run
+# Streamlit Cloud Run flags
 ENV STREAMLIT_SERVER_HEADLESS=true
 ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 
-# Cloud Run will set PORT dynamically
-ENV PORT=8080
-
+# Expose the correct port (Cloud Run uses PORT env)
 EXPOSE 8080
 
-# Start Streamlit
-CMD ["bash", "-c", "streamlit run app.py --server.port=$PORT --server.address=0.0.0.0"]
+# Cloud Run passes PORT dynamically
+ENV PORT=8080
+
+# start Streamlit
+CMD streamlit run app.py --server.port=$PORT --server.address=0.0.0.0

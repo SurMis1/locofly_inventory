@@ -1,23 +1,53 @@
-import streamlit as st
-import pandas as pd
-from sqlalchemy import create_engine, text
+import os
 from datetime import datetime
 
-# ======================================================
-# 🔗 PostgreSQL Connection
-# ======================================================
-import os
+import pandas as pd
+import streamlit as st
 from sqlalchemy import create_engine, text
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-engine = create_engine(DATABASE_URL)
+# ======================================================
+# 🔗 PostgreSQL Connection (Lazy + Cloud Run friendly)
+# ======================================================
+
+@st.cache_resource
+def get_engine():
+    """
+    Create and cache a SQLAlchemy engine.
+
+    Priority:
+    1. If DATABASE_URL is set -> use it directly.
+    2. Else build a Cloud SQL socket URL from DB_* env vars.
+    """
+    database_url = os.getenv("DATABASE_URL")
+
+    if not database_url:
+        db_user = os.environ["DB_USER"]
+        db_password = os.environ["DB_PASSWORD"]
+        db_name = os.environ["DB_NAME"]
+        db_host = os.environ["DB_HOST"]  # instance connection name like project:region:instance
+
+        # Cloud SQL over Unix socket
+        # /cloudsql/<instance_connection_name>
+        socket_dir = "/cloudsql"
+        database_url = (
+            f"postgresql+psycopg2://{db_user}:{db_password}@/{db_name}"
+            f"?host={socket_dir}/{db_host}"
+        )
+
+    engine = create_engine(
+        database_url,
+        pool_pre_ping=True,
+    )
+    return engine
+
 
 # ======================================================
 # 🎨 Page Layout + Styling
 # ======================================================
 st.set_page_config(page_title="Locofly Inventory System", layout="wide")
 
-st.markdown("""
+st.markdown(
+    """
 <style>
 
 body { background-color: #F6F8FC; }
@@ -52,13 +82,15 @@ input, textarea { border-radius: 10px !important; }
 }
 
 </style>
-""", unsafe_allow_html=True)
-
+""",
+    unsafe_allow_html=True,
+)
 
 # ======================================================
 # 📌 Load All Locations
 # ======================================================
 def get_all_locations():
+    engine = get_engine()
     with engine.begin() as conn:
         result = conn.execute(
             text("SELECT DISTINCT location_id FROM inventory ORDER BY location_id")
@@ -67,7 +99,6 @@ def get_all_locations():
 
 
 locations = get_all_locations()
-
 
 # ======================================================
 # 🔍 QR Auto-Select Logic
@@ -80,7 +111,7 @@ sidebar_enabled = True
 
 if "loc" in query_params:
     qr_loc = query_params["loc"]
-    if isinstance(qr_loc, list):  
+    if isinstance(qr_loc, list):
         qr_loc = qr_loc[0]
 
     if qr_loc in locations:
@@ -91,20 +122,20 @@ if "item" in query_params:
     if isinstance(qr_item, list):
         qr_item = qr_item[0]
 
-
 # ======================================================
 # HEADER
 # ======================================================
-st.markdown("""
+st.markdown(
+    """
 <div class="header-box">
     <h1 style="margin:0; font-size:34px;">📦 Locofly Inventory System</h1>
     <p style="margin-top:6px; margin-bottom:0; font-size:16px; opacity:0.95;">
         Fast. Simple. Reliable. Track your stock in real-time.
     </p>
 </div>
-""", unsafe_allow_html=True)
-
-
+""",
+    unsafe_allow_html=True,
+)
 
 # ======================================================
 # 🔍 PICKER VIEW — Scan Product Barcode
@@ -114,16 +145,17 @@ st.markdown("## 🔍 Picker View – Scan Product Barcode")
 barcode_input = st.text_input("Scan / Type Product Barcode")
 
 if st.button("Search Barcode"):
-
     if not barcode_input.strip():
         st.error("Please scan or type a valid barcode.")
         st.stop()
+
+    engine = get_engine()
 
     # 1️⃣ Fetch item name
     with engine.begin() as conn:
         row = conn.execute(
             text("SELECT item_name FROM barcode_master WHERE barcode = :b"),
-            {"b": barcode_input.strip()}
+            {"b": barcode_input.strip()},
         ).fetchone()
 
     if not row:
@@ -136,14 +168,16 @@ if st.button("Search Barcode"):
     # 2️⃣ Fetch all locations containing this item
     with engine.begin() as conn:
         loc_df = pd.read_sql(
-            text("""
+            text(
+                """
                 SELECT location_id, quantity, updated_at
                 FROM inventory
                 WHERE item_name = :item
                 ORDER BY updated_at DESC
-            """),
+            """
+            ),
             conn,
-            params={"item": item_name_from_code}
+            params={"item": item_name_from_code},
         )
 
     if loc_df.empty:
@@ -157,8 +191,6 @@ if st.button("Search Barcode"):
     for row in loc_df.itertuples():
         L = row.location_id
         st.markdown(f"- 🔗 [Open {L}](?loc={L}&item={item_name_from_code})")
-
-
 
 # ======================================================
 # 📍 SIDEBAR — Only if NOT QR navigation
@@ -174,21 +206,22 @@ if sidebar_enabled:
         if not new_loc.strip():
             st.sidebar.error("Location ID cannot be blank")
         else:
+            engine = get_engine()
             with engine.begin() as conn:
                 conn.execute(
-                    text("""
+                    text(
+                        """
                         INSERT INTO inventory (location_id, item_name, quantity, updated_at)
                         VALUES (:loc, '', 0, :ts)
                         ON CONFLICT DO NOTHING
-                    """),
-                    {"loc": new_loc.strip(), "ts": datetime.now()}
+                    """
+                    ),
+                    {"loc": new_loc.strip(), "ts": datetime.now()},
                 )
             st.sidebar.success(f"Location '{new_loc}' created.")
             st.rerun()
-
 else:
     selected_loc = qr_loc
-
 
 # If STILL nothing selected → stop
 if not selected_loc:
@@ -197,28 +230,31 @@ if not selected_loc:
 
 loc = selected_loc
 
-
-
 # ======================================================
 # 🧾 ITEMS IN LOCATION
 # ======================================================
-st.markdown(f"<div class='card'><h3>📍 Location: <code>{loc}</code></h3>", unsafe_allow_html=True)
+st.markdown(
+    f"<div class='card'><h3>📍 Location: <code>{loc}</code></h3>",
+    unsafe_allow_html=True,
+)
 
+engine = get_engine()
 with engine.begin() as conn:
     items_df = pd.read_sql(
-        text("""
+        text(
+            """
             SELECT item_name, quantity, updated_at
             FROM inventory
             WHERE location_id = :loc AND item_name <> ''
             ORDER BY item_name
-        """),
+        """
+        ),
         conn,
-        params={"loc": loc}
+        params={"loc": loc},
     )
 
 st.dataframe(items_df, use_container_width=True)
 st.markdown("</div>", unsafe_allow_html=True)
-
 
 # ======================================================
 # 🛠 ADD / UPDATE ITEM
@@ -231,7 +267,9 @@ default_item = qr_item if qr_item else ""
 item_name = st.text_input("Item Name", value=default_item, key="item_input")
 quantity = st.number_input("Quantity", step=1, min_value=0, key="qty_input")
 
-c1, c2 = st.columns([1,1])
+c1, c2 = st.columns([1, 1])
+
+engine = get_engine()
 
 with c1:
     if st.button("Save / Update", type="primary"):
@@ -240,13 +278,20 @@ with c1:
         else:
             with engine.begin() as conn:
                 conn.execute(
-                    text("""
+                    text(
+                        """
                         INSERT INTO inventory (location_id, item_name, quantity, updated_at)
                         VALUES (:loc, :item, :qty, :ts)
                         ON CONFLICT (location_id, item_name)
                         DO UPDATE SET quantity = :qty, updated_at = :ts
-                    """),
-                    {"loc": loc, "item": item_name.strip(), "qty": quantity, "ts": datetime.now()}
+                    """
+                    ),
+                    {
+                        "loc": loc,
+                        "item": item_name.strip(),
+                        "qty": quantity,
+                        "ts": datetime.now(),
+                    },
                 )
             st.success(f"Item '{item_name}' saved/updated.")
             st.rerun()
@@ -258,8 +303,10 @@ with c2:
         else:
             with engine.begin() as conn:
                 conn.execute(
-                    text("DELETE FROM inventory WHERE location_id = :loc AND item_name = :item"),
-                    {"loc": loc, "item": item_name.strip()}
+                    text(
+                        "DELETE FROM inventory WHERE location_id = :loc AND item_name = :item"
+                    ),
+                    {"loc": loc, "item": item_name.strip()},
                 )
             st.warning(f"Item '{item_name}' deleted.")
             st.rerun()

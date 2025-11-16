@@ -5,28 +5,24 @@ FROM python:3.10-slim
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
+RUN apt-get update && apt-get install -y build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# copy dependencies
-COPY requirements.txt requirements.txt
+# Copy requirements
+COPY requirements.txt .
 
-# install python deps
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# copy everything else
+# Copy rest of the app
 COPY . .
 
 # Streamlit Cloud Run flags
 ENV STREAMLIT_SERVER_HEADLESS=true
 ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 
-# Expose the correct port (Cloud Run uses PORT env)
+# Expose port (Cloud Run will actually set $PORT)
 EXPOSE 8080
 
-# Cloud Run passes PORT dynamically
-ENV PORT=8080
-
-# start Streamlit
-CMD streamlit run app.py --server.port=$PORT --server.address=0.0.0.0
+# Use Cloud Run $PORT
+CMD ["streamlit", "run", "app.py", "--server.port=${PORT}", "--server.address=0.0.0.0"]

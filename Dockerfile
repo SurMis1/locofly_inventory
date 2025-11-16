@@ -24,5 +24,5 @@ ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 # Cloud Run uses dynamic PORT
 EXPOSE 8080
 
-# Correct entrypoint (bash needed for $PORT expansion)
-ENTRYPOINT ["bash", "-c", "streamlit run app.py --server.port=$PORT --server.address=0.0.0.0"]
+# Correct startup command for Cloud Run
+CMD ["bash", "-c", "streamlit run app.py --server.port=$PORT --server.address=0.0.0.0"]

@@ -14,15 +14,15 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the app
+# Copy rest of the app
 COPY . .
 
-# Streamlit flags
+# Streamlit Cloud Run flags
 ENV STREAMLIT_SERVER_HEADLESS=true
 ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 
 # Cloud Run uses dynamic PORT
 EXPOSE 8080
 
-# Use shell form so $PORT expands correctly
-ENTRYPOINT ["bash", "-c", "streamlit run app.py --server.port=$PORT --server.address=0.0.0.0"]
+# Correct ENTRYPOINT with PORT expansion
+ENTRYPOINT ["bash", "-c", "streamlit run app.py --server.port=${PORT} --server.address=0.0.0.0"]

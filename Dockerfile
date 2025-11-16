@@ -1,29 +1,31 @@
-# Use an official Python runtime
+# Use official Python image
 FROM python:3.10-slim
 
-# Prevent Python buffering
-ENV PYTHONUNBUFFERED True
-
-# Working directory
+# Set working directory
 WORKDIR /app
 
-# Install system dependencies (needed by psycopg2)
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
-    libpq-dev gcc && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy and install Python dependencies
+# Copy dependency file
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app files
+# Copy everything
 COPY . .
 
-# Cloud Run sets $PORT automatically
+# Streamlit requires special flags for Cloud Run
+ENV STREAMLIT_SERVER_HEADLESS=true
+ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+
+# Cloud Run will set PORT dynamically
 ENV PORT=8080
 
-# Expose the port (Optional, safe to keep)
 EXPOSE 8080
 
 # Start Streamlit
-CMD ["streamlit", "run", "app.py", "--server.port=$PORT", "--server.address=0.0.0.0"]
+CMD ["bash", "-c", "streamlit run app.py --server.port=$PORT --server.address=0.0.0.0"]

@@ -13,7 +13,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is not set in Cloud Run")
 
-# Small connection pool – enough for a few concurrent pickers
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
@@ -21,34 +20,25 @@ engine = create_engine(
     max_overflow=2,
 )
 
-
 # ======================================================
-# 🔁 Safe DB helpers – avoid stuck transactions
+# 🔁 Safe DB helpers (avoid stuck transactions)
 # ======================================================
 def _safe_read_df(sql: str, params: dict | None = None) -> pd.DataFrame:
-    """
-    Run a SELECT and return a DataFrame.
-    If any DB error happens, dispose the pool so Cloud Run gets fresh connections.
-    """
     try:
         with engine.connect() as conn:
             return pd.read_sql(text(sql), conn, params=params or {})
-    except SQLAlchemyError:
+    except SQLAlchemyError as e:
         engine.dispose()
-        raise
+        raise e
 
 
 def _safe_exec(sql: str, params: dict | None = None) -> None:
-    """
-    Run INSERT / UPDATE / DELETE without returning rows.
-    """
     try:
         with engine.begin() as conn:
             conn.execute(text(sql), params or {})
-    except SQLAlchemyError:
+    except SQLAlchemyError as e:
         engine.dispose()
-        raise
-
+        raise e
 
 # ======================================================
 # 📦 Core DB functions
@@ -64,7 +54,12 @@ def get_all_locations() -> list[int]:
     return df["location_id"].astype(int).tolist()
 
 
-def get_items_for_location(location_id: int) -> pd.DataFrame:
+def get_items_for_location(loc_value) -> pd.DataFrame:
+    try:
+        loc = int(loc_value)
+    except (TypeError, ValueError):
+        return pd.DataFrame(columns=["item_name", "quantity", "updated_at", "barcode"])
+
     return _safe_read_df(
         """
         SELECT item_name, quantity, updated_at, barcode
@@ -73,32 +68,33 @@ def get_items_for_location(location_id: int) -> pd.DataFrame:
           AND item_name <> ''
         ORDER BY item_name
         """,
-        {"loc": location_id},
+        {"loc": loc},
     )
 
 
-def get_current_qty(location_id: int, item_name: str) -> int | None:
-    df = _safe_read_df(
-        """
-        SELECT quantity
-        FROM inventory
-        WHERE location_id = :loc AND item_name = :item
-        LIMIT 1
-        """,
-        {"loc": location_id, "item": item_name},
-    )
-    if df.empty:
-        return None
-    return int(df["quantity"].iloc[0])
-
-
-def log_movement(location_id: int, item_name: str, delta: int, new_qty: int) -> None:
-    if delta == 0:
-        return
+def log_movement(location_id: int, item_name: str, delta: int, new_qty: int, action: str):
+    """
+    Write a row to inventory_log.
+    Schema expected:
+      id SERIAL PK,
+      location_id INT NOT NULL,
+      item_name TEXT NOT NULL,
+      quantity_change INT,
+      new_quantity INT,
+      changed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      action TEXT NOT NULL
+    """
     _safe_exec(
         """
-        INSERT INTO inventory_log (location_id, item_name, quantity_change, new_quantity, changed_at)
-        VALUES (:loc, :item, :delta, :new_qty, :ts)
+        INSERT INTO inventory_log (
+            location_id,
+            item_name,
+            quantity_change,
+            new_quantity,
+            changed_at,
+            action
+        )
+        VALUES (:loc, :item, :delta, :new_qty, :ts, :action)
         """,
         {
             "loc": location_id,
@@ -106,19 +102,14 @@ def log_movement(location_id: int, item_name: str, delta: int, new_qty: int) -> 
             "delta": int(delta),
             "new_qty": int(new_qty),
             "ts": datetime.utcnow(),
+            "action": action,
         },
     )
 
 
 def upsert_item(location_id: int, item_name: str, quantity: int, barcode: str | None):
-    """
-    Create/update item and log the quantity change.
-    """
-    item_name = item_name.strip()
-    quantity = int(quantity)
-
-    old_qty = get_current_qty(location_id, item_name) or 0
-    delta = quantity - old_qty
+    item = item_name.strip()
+    qty = int(quantity)
 
     _safe_exec(
         """
@@ -132,387 +123,550 @@ def upsert_item(location_id: int, item_name: str, quantity: int, barcode: str | 
         """,
         {
             "loc": location_id,
-            "item": item_name,
-            "qty": quantity,
+            "item": item,
+            "qty": qty,
             "ts": datetime.utcnow(),
             "barcode": barcode,
         },
     )
 
-    log_movement(location_id, item_name, delta, quantity)
+    log_movement(location_id, item, delta=qty, new_qty=qty, action="upsert")
 
 
 def delete_item(location_id: int, item_name: str):
-    """
-    Delete an item completely from a location.
-    """
-    current = get_current_qty(location_id, item_name)
+    item = item_name.strip()
     _safe_exec(
         "DELETE FROM inventory WHERE location_id = :loc AND item_name = :item",
-        {"loc": location_id, "item": item_name.strip()},
+        {"loc": location_id, "item": item},
     )
-    if current is not None:
-        # Log as full negative movement
-        log_movement(location_id, item_name, -current, 0)
+    log_movement(location_id, item, delta=0, new_qty=0, action="delete")
 
 
 def quick_adjust_quantity(location_id: int, item_name: str, delta: int):
     """
-    +1 / -1 adjustments from quick buttons, with logging.
+    +1 / -1 adjustments from quick buttons.
     """
-    item_name = item_name.strip()
-    params = {
-        "delta": int(delta),
-        "ts": datetime.utcnow(),
-        "loc": location_id,
-        "item": item_name,
-    }
+    item = item_name.strip()
 
-    try:
-        with engine.begin() as conn:
-            row = conn.execute(
-                text(
-                    """
-                    UPDATE inventory
-                    SET quantity   = GREATEST(quantity + :delta, 0),
-                        updated_at = :ts
-                    WHERE location_id = :loc AND item_name = :item
-                    RETURNING quantity
-                    """
-                ),
-                params,
-            ).fetchone()
-    except SQLAlchemyError:
-        engine.dispose()
-        raise
-
-    if row is not None:
-        new_qty = int(row[0])
-        log_movement(location_id, item_name, delta, new_qty)
-
-
-# ---------- Barcode helpers ----------
-
-def find_item_by_barcode(barcode: str) -> str | None:
+    # Get current quantity
     df = _safe_read_df(
         """
-        SELECT item_name
-        FROM barcode_master
-        WHERE barcode = :bc
-        LIMIT 1
+        SELECT quantity
+        FROM inventory
+        WHERE location_id = :loc
+          AND item_name   = :item
         """,
-        {"bc": barcode},
+        {"loc": location_id, "item": item},
     )
     if df.empty:
-        return None
-    return df["item_name"].iloc[0]
+        return
 
+    current_qty = int(df.iloc[0]["quantity"])
+    new_qty = max(current_qty + int(delta), 0)
 
-def get_locations_for_item(item_name: str) -> pd.DataFrame:
-    return _safe_read_df(
+    _safe_exec(
         """
-        SELECT location_id, quantity, updated_at, barcode
-        FROM inventory
-        WHERE item_name = :item
-        ORDER BY location_id
+        UPDATE inventory
+        SET quantity   = :new_qty,
+            updated_at = :ts
+        WHERE location_id = :loc
+          AND item_name   = :item
         """,
-        {"item": item_name},
+        {
+            "new_qty": new_qty,
+            "ts": datetime.utcnow(),
+            "loc": location_id,
+            "item": item,
+        },
     )
 
+    log_movement(location_id, item, delta=int(delta), new_qty=new_qty, action="quick-adjust")
 
 # ======================================================
-# 🎨 Streamlit layout & theming
+# 🎨 Streamlit global config
 # ======================================================
 st.set_page_config(
     page_title="Locofly Inventory System",
     layout="wide",
 )
 
+# Mobile-first CSS
 st.markdown(
     """
     <style>
+    /* Make content full width but keep a nice max width on desktop */
+    .block-container {
+        padding-top: 0.6rem;
+        padding-bottom: 3rem;
+        padding-left: 0.9rem;
+        padding-right: 0.9rem;
+        max-width: 900px;
+        margin: 0 auto;
+    }
+
     body {
-        background: #F2F4F7;
-        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background-color: #F5F7FB;
+        font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
     }
 
-    .header-box {
-        background: linear-gradient(135deg, #4285F4 0%, #6CA0FF 100%);
-        padding: 26px 28px;
-        color: white;
+    .lf-header-card {
+        background: linear-gradient(135deg, #2563EB, #4F46E5);
+        padding: 16px 18px;
         border-radius: 18px;
-        margin-bottom: 30px;
-        box-shadow: 0px 10px 30px rgba(15, 23, 42, 0.35);
+        color: white;
+        box-shadow: 0 14px 30px rgba(37, 99, 235, 0.25);
+        margin-bottom: 14px;
     }
-    .header-title {
-        font-size: 32px;
-        font-weight: 800;
-        letter-spacing: -0.5px;
+    .lf-header-title {
+        font-size: 24px;
+        font-weight: 700;
         margin-bottom: 4px;
+        display:flex;
+        align-items:center;
+        gap:0.4rem;
     }
-    .header-sub {
-        font-size: 14px;
-        opacity: 0.92;
-    }
-
-    .card {
-        background: #ffffff;
-        padding: 20px 22px;
-        border-radius: 16px;
-        box-shadow: 0px 4px 15px rgba(15, 23, 42, 0.08);
-        margin-bottom: 18px;
-    }
-
-    .qty-chip {
-        display:inline-block;
-        padding: 4px 12px;
-        border-radius: 999px;
+    .lf-header-sub {
         font-size: 13px;
-        font-weight: 600;
-        background:#E8ECFF;
-        color:#1D2A73;
+        opacity: 0.9;
     }
 
-    .edit-panel {
-        background:#F7F9FB;
-        border-radius:14px;
-        padding:14px;
-        border-left:4px solid #4F8BF9;
-        margin-top:8px;
-        box-shadow:0px 4px 12px rgba(15, 23, 42, 0.08);
+    .lf-chip-loc {
+        display:inline-flex;
+        align-items:center;
+        gap:0.25rem;
+        background: rgba(15,23,42,0.25);
+        padding: 4px 9px;
+        border-radius: 999px;
+        font-size: 11px;
+        margin-top: 4px;
+    }
+
+    .lf-card {
+        background: #FFFFFF;
+        border-radius: 14px;
+        padding: 14px 14px 10px 14px;
+        box-shadow: 0 4px 18px rgba(15,23,42,0.08);
+        margin-bottom: 12px;
+    }
+
+    .lf-card-title {
+        font-size: 16px;
+        font-weight: 600;
+        margin-bottom: 4px;
+        display:flex;
+        align-items:center;
+        gap:0.45rem;
+    }
+
+    .lf-subtext {
+        font-size: 12px;
+        color:#6B7280;
+        margin-bottom: 6px;
+    }
+
+    .lf-item-card {
+        border-radius: 12px;
+        padding: 10px 12px;
+        background: #F9FAFB;
+        border: 1px solid #E5E7EB;
+        margin-bottom: 8px;
+    }
+
+    .lf-item-header {
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
+        gap:0.75rem;
+    }
+
+    .lf-item-name {
+        font-weight: 600;
+        font-size: 14px;
+        color:#111827;
+    }
+
+    .lf-qty-chip {
+        display:inline-flex;
+        align-items:center;
+        padding: 2px 10px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 600;
+        background:#EEF2FF;
+        color:#3730A3;
+        border: 1px solid #E0E7FF;
+    }
+
+    .lf-item-actions {
+        margin-top: 8px;
+    }
+
+    .lf-item-actions-row {
+        display:flex;
+        gap:0.4rem;
+        align-items:center;
+    }
+
+    .lf-small-note {
+        font-size:11px;
+        color:#9CA3AF;
     }
 
     .stButton>button {
         border-radius: 999px;
         font-weight: 600;
-        font-size: 14px;
-        padding: 6px 18px;
-        border: none;
-        box-shadow:0 2px 6px rgba(15,23,42,0.15);
+        padding: 4px 14px;
+        font-size: 13px;
     }
 
-    input, textarea {
-        border-radius: 10px !important;
+    /* Primary pill buttons */
+    .lf-pill-primary button {
+        background: linear-gradient(135deg,#2563EB,#4F46E5);
+        color:white;
+        border:none;
     }
 
+    .lf-pill-ghost button {
+        background: white;
+        border:1px solid #E5E7EB;
+        color:#374151;
+    }
+
+    .lf-plusminus button {
+        width: 44px;
+        height: 32px;
+        border-radius: 999px;
+        font-size: 16px;
+        font-weight: 700;
+    }
+
+    @media (max-width: 768px) {
+        .block-container {
+            padding-left: 0.6rem;
+            padding-right: 0.6rem;
+        }
+        .lf-item-actions-row {
+            gap:0.3rem;
+        }
+        .stDataFrame {
+            font-size: 11px;
+        }
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ======================================================
-# 🔝 Header
+# 🔍 Query params: allow ?loc=...&item=...
 # ======================================================
-st.markdown(
-    """
-    <div class="header-box">
-      <div class="header-title">📦 Locofly Inventory System</div>
-      <div class="header-sub">
-        Fast, simple, reliable stock control for dark store locations & pickers.
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+qr_params = st.query_params if hasattr(st, "query_params") else {}
+qr_loc = qr_params.get("loc")
+qr_item = qr_params.get("item")
 
 # ======================================================
-# 📍 Sidebar: Location Manager
+# 🧭 Top header + location selector (mobile-style)
 # ======================================================
-st.sidebar.header("📍 Location Manager")
-
 all_locations = get_all_locations()
 
-# Use session_state so barcode view can "jump" the manager to a location
-if "selected_loc_label" not in st.session_state:
-    if all_locations:
-        st.session_state.selected_loc_label = str(all_locations[0])
-    else:
-        st.session_state.selected_loc_label = "(Create New)"
+# Fallback if no locations yet
+if not all_locations:
+    st.markdown(
+        """
+        <div class="lf-header-card">
+            <div class="lf-header-title">📦 Locofly Inventory System</div>
+            <div class="lf-header-sub">
+                No locations yet. Create your first location below to start tracking stock.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+else:
+    active_loc_initial = None
+    # Use QR loc if valid
+    if qr_loc:
+        try:
+            loc_int = int(qr_loc)
+            if loc_int in all_locations:
+                active_loc_initial = str(loc_int)
+        except ValueError:
+            pass
+    if active_loc_initial is None:
+        active_loc_initial = str(all_locations[0])
 
-location_labels = [str(x) for x in all_locations]
-selected_loc_label = st.sidebar.selectbox(
-    "Select Location",
-    options=["(Create New)"] + location_labels,
-    key="selected_loc_label",
-)
+    st.markdown(
+        f"""
+        <div class="lf-header-card">
+            <div class="lf-header-title">
+                📦 Locofly Inventory System
+            </div>
+            <div class="lf-header-sub">
+                Fast, simple stock control for dark store locations.
+                <div class="lf-chip-loc">
+                    <span>Active location:</span>
+                    <strong>{active_loc_initial}</strong>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-new_loc_input = st.sidebar.text_input("Enter new location_id (number)")
-
-if st.sidebar.button("Create Location"):
-    try:
-        new_loc_id = int(new_loc_input)
-        if new_loc_id in all_locations:
-            st.sidebar.warning("Location already exists.")
-        else:
-            # Insert empty row so it shows up
-            _safe_exec(
-                """
-                INSERT INTO inventory (location_id, item_name, quantity, updated_at)
-                VALUES (:loc, '', 0, :ts)
-                ON CONFLICT DO NOTHING
-                """,
-                {"loc": new_loc_id, "ts": datetime.utcnow()},
-            )
-            st.sidebar.success(f"Location {new_loc_id} created.")
-            st.session_state.selected_loc_label = str(new_loc_id)
-            st.rerun()
-    except ValueError:
-        st.sidebar.error("Location id must be a number.")
-
-active_loc: int | None = None
-if selected_loc_label != "(Create New)":
-    active_loc = int(selected_loc_label)
-
-# ======================================================
-# 🔍 Picker View – barcode first
-# ======================================================
+# Location manager card
 with st.container():
-    picker_card = st.container()
-    with picker_card:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("🔍 Picker View – Scan Product Barcode")
+    st.markdown('<div class="lf-card">', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="lf-card-title">📍 Location manager</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="lf-subtext">Choose a location or create a new rack / bin for the store.</div>',
+        unsafe_allow_html=True,
+    )
 
-        barcode_input = st.text_input(
-            "Scan / Type Product Barcode",
-            key="barcode_input",
-            placeholder="Example: 8901234567890",
+    col_loc_sel, col_new_loc = st.columns([2, 2])
+
+    # Select existing
+    with col_loc_sel:
+        loc_options = [str(l) for l in all_locations] if all_locations else []
+        selected_loc_label = st.selectbox(
+            "Active location",
+            options=loc_options,
+            index=loc_options.index(active_loc_initial) if all_locations else 0,
+            key="active_loc_select",
         )
-        scan_col, _ = st.columns([1, 4])
-        with scan_col:
-            scan_pressed = st.button("Search Barcode")
 
-        if scan_pressed and barcode_input.strip():
-            bc = barcode_input.strip()
-            item_name = find_item_by_barcode(bc)
-            if not item_name:
-                st.warning("Barcode not found in barcode_master. Add mapping first.")
-            else:
-                st.success(f"Barcode found → **{item_name}**")
-                loc_df = get_locations_for_item(item_name)
-                if loc_df.empty:
-                    st.info("This item is not stored in any location yet.")
+    # Create new
+    with col_new_loc:
+        new_loc_input = st.text_input("New location id (number)", key="new_loc_input")
+        create_new = st.button("Create location", key="btn_create_loc")
+
+        if create_new:
+            try:
+                new_loc_id = int(new_loc_input)
+                if new_loc_id in all_locations:
+                    st.warning("Location already exists.")
                 else:
-                    st.markdown("**Stored in these locations:**")
-                    st.dataframe(loc_df, use_container_width=True)
+                    _safe_exec(
+                        """
+                        INSERT INTO inventory (location_id, item_name, quantity, updated_at)
+                        VALUES (:loc, '', 0, :ts)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        {"loc": new_loc_id, "ts": datetime.utcnow()},
+                    )
+                    st.success(f"Location {new_loc_id} created.")
+                    st.rerun()
+            except ValueError:
+                st.error("Location id must be a number.")
 
-                    st.markdown("Tap a location to jump to quick edit:")
-                    for _, r in loc_df.iterrows():
-                        loc_id = int(r["location_id"])
-                        c1, c2 = st.columns([3, 1])
-                        with c1:
-                            st.markdown(
-                                f"- Location **{loc_id}** · Qty: **{int(r['quantity'])}**"
-                            )
-                        with c2:
-                            if st.button(
-                                "Open",
-                                key=f"open_loc_{loc_id}_{item_name}",
-                            ):
-                                st.session_state.selected_loc_label = str(loc_id)
-                                st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown("</div>", unsafe_allow_html=True)
-
-# If no active location, stop after picker card
-if active_loc is None:
-    st.info("Select a location on the left to manage its stock.")
+# Determine current active loc
+try:
+    active_loc = int(selected_loc_label)
+except (TypeError, ValueError):
     st.stop()
 
 # ======================================================
-# 📊 Items table for active location
+# 🔍 Picker – Barcode scan card
+# ======================================================
+with st.container():
+    st.markdown('<div class="lf-card">', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="lf-card-title">🔍 Picker view – scan barcode</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="lf-subtext">Focus the input, scan with phone camera / scanner, and hit search.</div>',
+        unsafe_allow_html=True,
+    )
+
+    col_bc, col_btn = st.columns([3, 1])
+    with col_bc:
+        barcode_input = st.text_input(
+            "Scan or type product barcode",
+            key="barcode_input",
+            value=str(qr_item) if qr_item else "",
+        )
+    with col_btn:
+        st.markdown('<div class="lf-pill-primary">', unsafe_allow_html=True)
+        scan_pressed = st.button("Search barcode", key="btn_search_barcode")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if scan_pressed and barcode_input.strip():
+        df_barc = _safe_read_df(
+            """
+            SELECT item_name, location_id
+            FROM inventory
+            WHERE barcode = :bc
+              AND item_name <> ''
+            ORDER BY location_id, item_name
+            """,
+            {"bc": barcode_input.strip()},
+        )
+        if df_barc.empty:
+            st.warning("Barcode not linked to any item yet.")
+        else:
+            st.success("Barcode found:")
+            st.dataframe(df_barc, use_container_width=True, hide_index=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ======================================================
+# 📊 Current stock table
 # ======================================================
 items_df = get_items_for_location(active_loc)
 
-st.markdown('<div class="card">', unsafe_allow_html=True)
-st.markdown(f"### 📊 Current stock – Location `{active_loc}`")
-st.dataframe(items_df, use_container_width=True)
-st.markdown("</div>", unsafe_allow_html=True)
+with st.container():
+    st.markdown('<div class="lf-card">', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="lf-card-title">📊 Current stock</div>',
+        unsafe_allow_html=True,
+    )
+
+    if items_df.empty:
+        st.info("No items in this location yet. Add items below.")
+    else:
+        st.dataframe(items_df, use_container_width=True, hide_index=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # ======================================================
-# ⚡ Quick edit list with +1 / −1 and inline edit
+# ⚡ Quick edit section (mobile cards)
 # ======================================================
-st.markdown('<div class="card">', unsafe_allow_html=True)
-st.markdown("### ⚡ Quick edit")
+with st.container():
+    st.markdown('<div class="lf-card">', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="lf-card-title">⚡ Quick edit</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="lf-subtext">Tap +1 / –1 to adjust stock, or use edit for precise quantity & delete.</div>',
+        unsafe_allow_html=True,
+    )
 
-if items_df.empty:
-    st.info("No items in this location yet. Use the form below to add items.")
-else:
-    for _, row in items_df.iterrows():
-        item = row["item_name"]
-        qty = int(row["quantity"])
+    if items_df.empty:
+        st.info("No items to quick-edit here.")
+    else:
+        for _, row in items_df.iterrows():
+            item = str(row["item_name"])
+            qty = int(row["quantity"])
+            barcode_val = row.get("barcode", None)
 
-        c1, c2, c3, c4 = st.columns([4, 2, 2, 4])
-        with c1:
-            st.markdown(f"**{item}**")
-        with c2:
+            # Wrapper card
+            st.markdown('<div class="lf-item-card">', unsafe_allow_html=True)
             st.markdown(
-                f'<span class="qty-chip">Qty: {qty}</span>',
+                f"""
+                <div class="lf-item-header">
+                    <div class="lf-item-name">{item}</div>
+                    <div class="lf-qty-chip">Qty: {qty}</div>
+                </div>
+                """,
                 unsafe_allow_html=True,
             )
-        with c3:
-            minus = st.button("−1", key=f"minus_{active_loc}_{item}")
-            plus = st.button("+1", key=f"plus_{active_loc}_{item}")
-        with c4:
-            with st.expander("Edit / Delete", expanded=False):
+
+            if barcode_val:
+                st.markdown(
+                    f'<div class="lf-small-note">Barcode: {barcode_val}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            # Action row
+            st.markdown('<div class="lf-item-actions">', unsafe_allow_html=True)
+            c_minus, c_plus, c_edit = st.columns([1, 1, 2.2])
+
+            with c_minus:
+                st.markdown('<div class="lf-plusminus">', unsafe_allow_html=True)
+                minus = st.button("−", key=f"minus_{active_loc}_{item}")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            with c_plus:
+                st.markdown('<div class="lf-plusminus">', unsafe_allow_html=True)
+                plus = st.button("+", key=f"plus_{active_loc}_{item}")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+            with c_edit:
+                edit_mode = st.selectbox(
+                    "Edit / Delete",
+                    options=["Choose", "Edit quantity", "Delete item"],
+                    key=f"mode_{active_loc}_{item}",
+                    label_visibility="collapsed",
+                )
+
+            if minus:
+                quick_adjust_quantity(active_loc, item, -1)
+                st.rerun()
+            if plus:
+                quick_adjust_quantity(active_loc, item, +1)
+                st.rerun()
+
+            # Slide-down panel for edit / delete
+            if edit_mode == "Edit quantity":
                 new_qty = st.number_input(
                     f"Set quantity for {item}",
                     min_value=0,
                     step=1,
                     value=qty,
-                    key=f"edit_qty_{active_loc}_{item}",
+                    key=f"qty_edit_{active_loc}_{item}",
                 )
-                save_col, del_col, _ = st.columns([1, 1, 2])
-                with save_col:
-                    if st.button("Save", key=f"save_{active_loc}_{item}"):
-                        upsert_item(active_loc, item, new_qty, barcode=row.get("barcode"))
-                        st.success("Updated.")
-                        st.rerun()
-                with del_col:
-                    if st.button("Delete", key=f"del_{active_loc}_{item}"):
-                        delete_item(active_loc, item)
-                        st.warning("Item deleted.")
-                        st.rerun()
+                col_save, _ = st.columns([1, 3])
+                with col_save:
+                    st.markdown('<div class="lf-pill-primary">', unsafe_allow_html=True)
+                    save_btn = st.button("Save", key=f"save_{active_loc}_{item}")
+                    st.markdown("</div>", unsafe_allow_html=True)
+                if save_btn:
+                    upsert_item(active_loc, item, new_qty, barcode_val)
+                    st.rerun()
 
-        if minus:
-            quick_adjust_quantity(active_loc, item, -1)
-            st.rerun()
+            elif edit_mode == "Delete item":
+                col_del, _ = st.columns([1, 3])
+                with col_del:
+                    st.markdown('<div class="lf-pill-ghost">', unsafe_allow_html=True)
+                    del_btn = st.button("Confirm delete", key=f"del_{active_loc}_{item}")
+                    st.markdown("</div>", unsafe_allow_html=True)
+                if del_btn:
+                    delete_item(active_loc, item)
+                    st.rerun()
 
-        if plus:
-            quick_adjust_quantity(active_loc, item, +1)
-            st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)  # lf-item-actions
+            st.markdown("</div>", unsafe_allow_html=True)  # lf-item-card
 
-st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # ======================================================
 # 🛠 Add / Update item form
 # ======================================================
-st.markdown('<div class="card">', unsafe_allow_html=True)
-st.markdown("### 🛠 Add / Update Item")
-
-col_item, col_qty, col_barcode = st.columns([4, 2, 3])
-with col_item:
-    form_item_name = st.text_input(
-        "Item name",
-        key="form_item_name",
-        placeholder="e.g. Amul milk 1L",
+with st.container():
+    st.markdown('<div class="lf-card">', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="lf-card-title">🛠 Add / Update item</div>',
+        unsafe_allow_html=True,
     )
-with col_qty:
-    form_qty = st.number_input("Quantity", min_value=0, step=1, key="form_qty")
-with col_barcode:
-    form_barcode = st.text_input(
-        "Barcode (optional)",
-        key="form_barcode",
-        placeholder="8901…",
+    st.markdown(
+        '<div class="lf-subtext">Use this when you are stocking a new product or doing a full correction.</div>',
+        unsafe_allow_html=True,
     )
 
-save_btn = st.button("Save / Update item", type="primary")
+    col_item, col_qty, col_barcode = st.columns([2.6, 1.2, 2])
+    with col_item:
+        form_item_name = st.text_input("Item name", key="form_item_name")
+    with col_qty:
+        form_qty = st.number_input("Quantity", min_value=0, step=1, key="form_qty")
+    with col_barcode:
+        form_barcode = st.text_input("Barcode (optional)", key="form_barcode")
 
-if save_btn:
-    if not form_item_name.strip():
-        st.error("Item name cannot be blank.")
-    else:
-        upsert_item(active_loc, form_item_name, form_qty, form_barcode or None)
-        st.success(f"Saved '{form_item_name}' at location {active_loc}.")
-        st.rerun()
+    st.markdown('<div class="lf-pill-primary">', unsafe_allow_html=True)
+    save_btn_main = st.button("Save / update item", key="btn_save_item")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-st.markdown("</div>", unsafe_allow_html=True)
+    if save_btn_main:
+        if not form_item_name.strip():
+            st.error("Item name cannot be blank.")
+        else:
+            upsert_item(active_loc, form_item_name, form_qty, form_barcode or None)
+            st.success(f"Saved '{form_item_name}' at location {active_loc}.")
+            st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
